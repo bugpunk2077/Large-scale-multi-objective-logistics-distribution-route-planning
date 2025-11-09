@@ -169,19 +169,30 @@ class GMOEA:
             cluster = [center]
             remaining.remove(center)
             
-            # 找到距离最近的K个点加入簇
-            K = min(20, len(remaining))  # 每簇最多20个点
+            # 找到距离最近的K个点加入簇（限制更小以产生更多路径）
+            K = min(8, len(remaining))  # 每簇最多8个点
             if remaining:
                 distances = [(c, self.problem.distance_matrix[center][c]) 
                            for c in remaining]
                 distances.sort(key=lambda x: x[1])
                 
-                # 添加最近的点直到违反容量约束
+                # 添加最近的点，同时确保pickup/delivery相对平衡
                 current_load = self.problem.demands[center]
+                pickups_sum = max(0, self.problem.demands[center])
+                deliveries_sum = abs(min(0, self.problem.demands[center]))
+                
                 for cust, _ in distances[:K]:
-                    if current_load + abs(self.problem.demands[cust]) <= self.problem.vehicle_capacity:
+                    demand = self.problem.demands[cust]
+                    new_pickups = pickups_sum + max(0, demand)
+                    new_deliveries = deliveries_sum + abs(min(0, demand))
+                    
+                    # 检查添加后是否仍然平衡（pickup和delivery的差不超过容量的40%）
+                    if (abs(new_pickups - new_deliveries) <= self.problem.vehicle_capacity * 0.4 and
+                        max(new_pickups, new_deliveries) <= self.problem.vehicle_capacity * 0.8):
                         cluster.append(cust)
-                        current_load += abs(self.problem.demands[cust])
+                        current_load += demand
+                        pickups_sum = new_pickups
+                        deliveries_sum = new_deliveries
                         remaining.remove(cust)
             
             clusters.append(cluster)
@@ -224,8 +235,14 @@ class GMOEA:
                     current_load = 0
                     continue
                 
-                # 检查是否需要开新路径
-                if current_load > self.problem.vehicle_capacity:
+                # 更严格的路径切分条件
+                need_new_route = False
+                if current_load > self.problem.vehicle_capacity * 0.8:  # 降低阈值，更早切分
+                    need_new_route = True
+                elif len(route) > 8:  # 限制每条路径最多服务8个客户
+                    need_new_route = True
+                
+                if need_new_route:
                     route.append(0)
                     routes.append(route)
                     route = [0]
@@ -234,6 +251,30 @@ class GMOEA:
             if len(route) > 1:
                 route.append(0)
                 routes.append(route)
+                
+            # 如果这个簇生成的路径太少，尝试进一步拆分最长的路径
+            cluster_routes = [r for r in routes if len(r) > 2]
+            while len(cluster_routes) < 3 and any(len(r) > 6 for r in cluster_routes):
+                longest_route = max(cluster_routes, key=len)
+                if len(longest_route) <= 4:  # 太短的路径不拆分
+                    break
+                    
+                # 找一个相对平衡的拆分点
+                mid = len(longest_route) // 2
+                r1 = [0] + longest_route[1:mid] + [0]
+                r2 = [0] + longest_route[mid:-1] + [0]
+                
+                # 检查拆分后的路径是否可行
+                r1_stats = route_stats(r1)
+                r2_stats = route_stats(r2)
+                if (abs(r1_stats[0] - r1_stats[1]) <= self.problem.vehicle_capacity * 0.4 and
+                    abs(r2_stats[0] - r2_stats[1]) <= self.problem.vehicle_capacity * 0.4):
+                    cluster_routes.remove(longest_route)
+                    cluster_routes.extend([r1, r2])
+                else:
+                    break  # 如果拆分后不平衡，就停止拆分
+                    
+            routes = [r for r in routes if len(r) <= 2] + cluster_routes
         
         return routes
 
@@ -266,15 +307,44 @@ class GMOEA:
 
     def enforce_vehicle_count(self, routes, min_v=1, max_v=None):
         """调整 routes 使得车辆数位于 [min_v, max_v] 范围内。
-        - 若车辆数 > max_v：尝试合并载货量小的路径，优先合并容量允许的对。
-        - 若车辆数 < min_v：尝试将负载大的路径拆分为多个路径，寻找可行拆分点。
-        该方法为启发式修复，尽量尊重 vehicle_capacity。
+        同时确保：
+        1. pickup/delivery 在路径内相对平衡
+        2. 路径长度相对均匀
+        3. 避免过度合并
         """
         if max_v is None:
             max_v = self.problem.num_vehicles
 
         # 清理空路径
         routes = [r for r in routes if len(r) > 2]
+        
+        def route_stats(route):
+            """计算路径的关键统计信息：
+            - pickup_sum: 取货总量
+            - delivery_sum: 送货总量
+            - length: 路径包含的客户数
+            - total_distance: 路径总距离
+            """
+            if len(route) <= 2:
+                return 0, 0, 0, 0
+            
+            pickup_sum = 0
+            delivery_sum = 0
+            length = len(route) - 2  # 减去首尾的仓库
+            total_distance = 0
+            
+            for i in range(len(route)-1):
+                from_node = route[i]
+                to_node = route[i+1]
+                if from_node != 0:
+                    demand = self.problem.demands[from_node]
+                    if demand > 0:
+                        pickup_sum += demand
+                    else:
+                        delivery_sum += abs(demand)
+                total_distance += self.problem.distance_matrix[from_node][to_node]
+                
+            return pickup_sum, delivery_sum, length, total_distance
 
         # helper: compute load of a route
         def route_load(route):
@@ -302,34 +372,53 @@ class GMOEA:
             required_capacity = initial_needed + max_pref
             return initial_needed, required_capacity, prefix
 
-        # 合并超出上限时：优先合并两个最小负载的路径（贪心）
+        # 合并超出上限时：在保持平衡的前提下谨慎合并
         if len(routes) > max_v:
-            # 尝试合并直到满足上限或无法再合并
-            merged = True
-            while len(routes) > max_v and merged:
+            while len(routes) > max_v:
                 merged = False
-                # 排序并尝试合并任意一对
-                routes_sorted = sorted(range(len(routes)), key=lambda i: route_load(routes[i]))
-                # 迭代小负载路线的候选合并
-                for i_idx in range(len(routes_sorted)):
-                    for j_idx in range(i_idx+1, len(routes_sorted)):
-                        i = routes_sorted[i_idx]
-                        j = routes_sorted[j_idx]
-                        r1 = routes[i]
-                        r2 = routes[j]
-                        # 对于带有 pickup(+)/delivery(-) 的需求，需要基于前缀和做可行性判断
-                        # 先构造合并后的路径（去掉重复仓库节点）并检查所需容量
+                # 计算所有路径的统计信息
+                stats = [(i, route_stats(route)) for i, route in enumerate(routes)]
+                # 按路径长度和负载排序，优先合并短路径
+                stats.sort(key=lambda x: (x[1][2], x[1][0] + x[1][1]))
+                
+                # 尝试合并相邻的短路径
+                for i in range(len(stats)-1):
+                    if merged:
+                        break
+                    i_idx = stats[i][0]
+                    i_pickup, i_delivery, i_len, i_dist = stats[i][1]
+                    
+                    for j in range(i+1, min(i+3, len(stats))):
+                        j_idx = stats[j][0]
+                        j_pickup, j_delivery, j_len, j_dist = stats[j][1]
+                        
+                        # 检查合并是否会导致严重不平衡
+                        if ((i_len + j_len > 10) or  # 限制合并后长度
+                            (abs((i_pickup + j_pickup) - (i_delivery + j_delivery)) > 
+                             self.problem.vehicle_capacity * 0.4)):  # 限制pickup/delivery差异
+                            continue
+                            
+                        # 构造合并路径并检查可行性
+                        r1, r2 = routes[i_idx], routes[j_idx]
                         new_route = r1[:-1] + r2[1:]
                         _, required_capacity, _ = route_feasibility_stats(new_route)
-                        if required_capacity <= self.problem.vehicle_capacity:
+                        
+                        if required_capacity <= self.problem.vehicle_capacity * 0.9:  # 留出10%余量
                             # 合并成功
-                            # 替换并删除更大的索引先
-                            a, b = sorted([i, j], reverse=True)
+                            a, b = sorted([i_idx, j_idx], reverse=True)
                             routes.pop(a)
                             routes.pop(b)
                             routes.append(new_route)
                             merged = True
                             break
+                            
+                if not merged:  # 如果无法找到好的合并方案，强制合并最小的两条
+                    if len(routes) >= 2:
+                        r1, r2 = routes[:2]
+                        new_route = r1[:-1] + r2[1:]
+                        routes = routes[2:] + [new_route]
+                    else:
+                        break  # 防止意外情况
                     if merged:
                         break
                 # 若未能合并任何对，退出循环
