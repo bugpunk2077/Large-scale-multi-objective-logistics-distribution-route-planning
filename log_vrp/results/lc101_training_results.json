@@ -1,0 +1,53 @@
+{
+  "config": {
+    "population_size": 50,
+    "max_generations": 200,
+    "hidden_dim": 64,
+    "learning_rate": 0.001,
+    "crossover_rate": 0.8,
+    "mutation_rate": 0.2,
+    "batch_size": 8,
+    "train_interval": 20,
+    "min_vehicles": 5,
+    "max_vehicles": 30
+  },
+  "training_time": 114.90236043930054,
+  "evaluation_results": {
+    "num_solutions": 5,
+    "hypervolume": 0.006356872180547431,
+    "best_distance": 1367.3588434247754,
+    "best_time": 675.7046320225468,
+    "best_vehicles": 2.0,
+    "avg_distance": 1767.761924741973,
+    "avg_time": 826.2342878283837,
+    "avg_vehicles": 3.4
+  },
+  "training_history": {
+    "policy_loss": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "value_loss": [
+      0.5100792568576124,
+      0.501308854769117,
+      0.8219126718384879,
+      0.3751193762208069,
+      0.2083828550153807,
+      0.35710551555166603,
+      0.33332470048727764,
+      0.5000204326012343,
+      0.3332269994298583,
+      0.7971000032765525
+    ],
+    "avg_objectives": [],
+    "hv_history": []
+  }
+}
