@@ -157,30 +157,84 @@ class GMOEA:
         return population
     
     def generate_random_solution(self):
-        """随机生成解决方案"""
+        """基于聚类和载重平衡生成初始解"""
         customers = list(range(1, self.problem.num_customers + 1))
-        random.shuffle(customers)
         
-        routes = []
-        current_route = [0]
-        current_load = 0
-        
-        for customer in customers:
-            demand = self.problem.demands[customer]
+        # 将客户按位置聚类（简单的基于距离的分组）
+        clusters = []
+        remaining = customers.copy()
+        while remaining:
+            # 随机选择一个中心点
+            center = random.choice(remaining)
+            cluster = [center]
+            remaining.remove(center)
             
-            if current_load + demand <= self.problem.vehicle_capacity:
-                current_route.append(customer)
-                current_load += demand
-            else:
-                current_route.append(0)
-                routes.append(current_route)
-                current_route = [0, customer]
-                current_load = demand
+            # 找到距离最近的K个点加入簇
+            K = min(20, len(remaining))  # 每簇最多20个点
+            if remaining:
+                distances = [(c, self.problem.distance_matrix[center][c]) 
+                           for c in remaining]
+                distances.sort(key=lambda x: x[1])
                 
-        if len(current_route) > 1:
-            current_route.append(0)
-            routes.append(current_route)
+                # 添加最近的点直到违反容量约束
+                current_load = self.problem.demands[center]
+                for cust, _ in distances[:K]:
+                    if current_load + abs(self.problem.demands[cust]) <= self.problem.vehicle_capacity:
+                        cluster.append(cust)
+                        current_load += abs(self.problem.demands[cust])
+                        remaining.remove(cust)
             
+            clusters.append(cluster)
+        
+        # 将每个簇转换为可行路径
+        routes = []
+        for cluster in clusters:
+            if not cluster:
+                continue
+                
+            # 对簇内客户重排序：混合 pickup/delivery 以保持可行性
+            pickups = [(c, self.problem.demands[c]) for c in cluster 
+                      if self.problem.demands[c] > 0]
+            deliveries = [(c, self.problem.demands[c]) for c in cluster 
+                         if self.problem.demands[c] <= 0]
+            
+            # 初始路径从较大的 pickup 开始
+            route = [0]  # 从仓库出发
+            
+            # 交替添加 pickup 和 delivery 以平衡载重
+            current_load = 0
+            while pickups or deliveries:
+                # 如果当前负载较低且有pickup，优先pickup
+                if current_load < self.problem.vehicle_capacity/2 and pickups:
+                    cust, demand = pickups.pop(
+                        max(range(len(pickups)), 
+                            key=lambda i: pickups[i][1]))
+                    route.append(cust)
+                    current_load += demand
+                # 否则尝试delivery
+                elif deliveries:
+                    cust, demand = deliveries.pop(0)
+                    route.append(cust)
+                    current_load += demand
+                # 如果只剩pickup但负载已高，开新路径
+                elif pickups:
+                    route.append(0)
+                    routes.append(route)
+                    route = [0]
+                    current_load = 0
+                    continue
+                
+                # 检查是否需要开新路径
+                if current_load > self.problem.vehicle_capacity:
+                    route.append(0)
+                    routes.append(route)
+                    route = [0]
+                    current_load = 0
+            
+            if len(route) > 1:
+                route.append(0)
+                routes.append(route)
+        
         return routes
 
     # 兼容旧代码接口：生成一个被认为“有效”的解（优先使用最近邻）
