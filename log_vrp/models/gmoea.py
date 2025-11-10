@@ -13,6 +13,9 @@ import random
 import time
 import numpy as np
 from utils.evaluator import calculate_hypervolume
+import torch
+import torch.nn as nn
+from models.neural_network import NeuralVRPSolver
 
 
 class Solution:
@@ -71,6 +74,24 @@ class GMOEA:
             'hv_history': []
         }
 
+        # --- 神经网络（可选） ---
+        self.use_nn = bool(self.config.get('use_nn', True))
+        self.device = torch.device(self.config.get('device', 'cuda' if torch.cuda.is_available() else 'cpu'))
+        self.nn_model = None
+        self.nn_optimizer = None
+        if self.use_nn:
+            try:
+                node_dim = int(self.config.get('node_dim', 5))
+                hidden_dim = int(self.config.get('hidden_dim', 64))
+                n_actions = len(self.problem.coordinates)
+                self.nn_model = NeuralVRPSolver(node_dim=node_dim, hidden_dim=hidden_dim, n_actions=n_actions, n_objectives=3)
+                self.nn_model.to(self.device)
+                lr = float(self.config.get('learning_rate', 1e-3))
+                self.nn_optimizer = torch.optim.Adam(self.nn_model.parameters(), lr=lr)
+            except Exception as e:
+                print(f"初始化神经网络失败，已禁用 NN 集成: {e}")
+                self.use_nn = False
+
     def run_training(self):
         start = time.time()
         population = self.initialize_population()
@@ -98,8 +119,8 @@ class GMOEA:
                 hv = 0.0
             self.training_history['hv_history'].append(float(hv))
 
-            # 实时打印（可配置）
-            if self.verbose and (gen % self.print_interval == 0 or gen == self.max_generations - 1):
+            # 实时打印（可配置） - 改为每代输出以满足需求
+            if self.verbose:
                 # population 的当前最小/均值目标
                 try:
                     pop_objs = np.array([ind.objectives for ind in population], dtype=float)
@@ -110,8 +131,14 @@ class GMOEA:
                 except Exception:
                     print(f"Gen {gen+1}/{self.max_generations} | Pareto {len(pareto)} | HV {hv:.4g}")
 
-            # NN 占位：不主动训练，仅填零，保证接口不变
-            if gen % self.train_interval == 0:
+            # NN 训练（若启用则按间隔训练并记录损失）
+            if self.use_nn and (gen % self.train_interval == 0):
+                ploss, vloss = self.train_nn(population)
+                # 记录到 history（保持与早期接口兼容）
+                self.training_history['policy_loss'].append(float(ploss))
+                self.training_history['value_loss'].append(float(vloss))
+            elif not self.use_nn and (gen % self.train_interval == 0):
+                # 保持原有占位行为
                 self.training_history['policy_loss'].append(0.0)
                 self.training_history['value_loss'].append(0.0)
 
@@ -151,9 +178,14 @@ class GMOEA:
         except Exception:
             pass
 
-        # 填充：最近邻与随机混合
+        # 填充：最近邻、随机与（可选）神经网络混合
         while len(population) < self.population_size:
-            if random.random() < 0.4:
+            if self.use_nn and random.random() < 0.3:
+                try:
+                    routes = self.generate_solution_with_nn()
+                except Exception:
+                    routes = None
+            elif random.random() < 0.4:
                 routes = self.nearest_neighbor_solution()
             else:
                 routes = self.generate_random_solution()
@@ -162,6 +194,74 @@ class GMOEA:
             s.evaluate(self.problem)
             population.append(s)
         return population
+
+    def generate_solution_with_nn(self):
+        """用当前 NN 模型生成一个解（贪心策略）。返回 routes 列表。"""
+        if not self.use_nn or self.nn_model is None:
+            raise RuntimeError('NN 未初始化')
+
+        self.nn_model.eval()
+        node_feats = self._build_node_features()
+        n_nodes = node_feats.shape[0]
+        node_feats_t = torch.tensor(node_feats, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        unvisited = set(range(1, self.problem.num_customers + 1))
+        routes = []
+
+        while unvisited:
+            cur = [0]
+            load = 0.0
+            pos = 0
+            while True:
+                visited_mask = torch.zeros((1, n_nodes), dtype=torch.bool, device=self.device)
+                for v in range(n_nodes):
+                    if v not in unvisited and v != 0:
+                        visited_mask[0, v] = True
+                # also mask depot as visited so policy won't pick it mid-route
+                visited_mask[0, 0] = True
+
+                current_tensor = torch.tensor([pos], dtype=torch.long, device=self.device)
+                try:
+                    with torch.no_grad():
+                        action_probs, action_logits = self.nn_model(node_feats_t, current_tensor, visited_mask)
+                except Exception:
+                    break
+
+                probs = action_probs.squeeze(0).cpu().numpy()
+                # choose highest-prob feasible candidate
+                cand_indices = np.argsort(-probs)
+                chosen = None
+                for idx in cand_indices:
+                    if idx == 0:
+                        continue
+                    if idx not in unvisited:
+                        continue
+                    d = float(self.problem.demands[idx])
+                    if load + d <= self.problem.vehicle_capacity:
+                        chosen = int(idx)
+                        break
+
+                if chosen is None:
+                    # 无可行客户，结束本车路线
+                    break
+
+                cur.append(chosen)
+                load += float(self.problem.demands[chosen])
+                unvisited.remove(chosen)
+                pos = chosen
+
+            cur.append(0)
+            if len(cur) > 2:
+                routes.append(cur)
+            else:
+                # 无法选到新客户，避免死循环
+                break
+
+        # 若仍有未访问客户，按贪心补上
+        for m in sorted(unvisited):
+            routes.append([0, m, 0])
+
+        return routes
 
     def generate_random_solution(self):
         customers = list(range(1, self.problem.num_customers + 1))
@@ -328,6 +428,144 @@ class GMOEA:
                 r.append(0)
                 final.append(r)
         return final
+
+    # ----------------- 神经网络相关辅助方法 -----------------
+    def _build_node_features(self):
+        """构建节点特征矩阵：[n_nodes, node_dim]
+
+        特征顺序: x, y, demand, earliest, latest
+        返回 numpy 数组 shape (n_nodes, node_dim)
+        """
+        coords = getattr(self.problem, 'coordinates', [])
+        demands = getattr(self.problem, 'demands', [])
+        tw = getattr(self.problem, 'time_windows', [])
+        n = len(coords)
+        feats = np.zeros((n, 5), dtype=float)
+        for i in range(n):
+            x, y = coords[i]
+            d = float(demands[i]) if i < len(demands) else 0.0
+            if i < len(tw):
+                earliest, latest = tw[i]
+            else:
+                earliest, latest = 0.0, 1e9
+            feats[i, :] = [x, y, d, float(earliest), float(latest)]
+        return feats
+
+    def _solution_to_route_tensor(self, solution, max_len):
+        """把一个 Solution 的所有客户按访问顺序拼接成索引序列，返回长度为 max_len 的 LongTensor（填充值 -1）。"""
+        # flatten all routes into a single customer sequence (exclude depot 0)
+        seq = []
+        for r in solution.routes:
+            for node in r:
+                if node != 0:
+                    seq.append(int(node))
+        seq = seq[:max_len]
+        padded = seq + ([-1] * (max_len - len(seq)))
+        return torch.LongTensor(padded)
+
+    def train_nn(self, population):
+        """使用当前种群训练神经网络（单次更新），返回 (policy_loss, value_loss)。"""
+        if not self.use_nn or self.nn_model is None or self.nn_optimizer is None:
+            return 0.0, 0.0
+
+        batch_size = int(self.config.get('batch_size', 8))
+        # 采样训练样本
+        samples = random.sample(population, min(batch_size, len(population)))
+
+        # 构建 node_features（一次性）
+        node_feats = self._build_node_features()  # (n_nodes, node_dim)
+        n_nodes, node_dim = node_feats.shape
+        # 小心内存：只复制必要的 batch 维度
+        node_feats_t = torch.tensor(node_feats, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        # 构建 solution route tensors
+        max_route_len = max(1, max((sum(len(r) - 2 for r in s.routes) for s in samples)))
+        route_tensors = torch.stack([self._solution_to_route_tensor(s, max_route_len) for s in samples], dim=0).to(self.device)
+
+        # 目标值（objectives）
+        targets = torch.tensor([s.objectives for s in samples], dtype=torch.float32, device=self.device)
+
+        self.nn_model.train()
+        self.nn_optimizer.zero_grad()
+
+        # 构造规范化因子（参考 evaluator 的 ref_point），用以稳定 Value 网络训练幅度
+        try:
+            maxd = float(np.max(self.problem.distance_matrix)) if hasattr(self.problem, 'distance_matrix') else 1.0
+        except Exception:
+            maxd = 1.0
+        ref = torch.tensor([maxd * 10.0, maxd * 10.0, max(1.0, float(getattr(self.problem, 'num_vehicles', 1))) * 2.0], dtype=torch.float32, device=self.device)
+
+        # 1) Value 网络预测与损失（使用规范化目标以避免数值爆炸）
+        try:
+            # 为 value 前向准备批次的 current_node 与 visited_mask
+            current_nodes = torch.zeros((len(samples),), dtype=torch.long, device=self.device)
+            visited_mask = torch.zeros((len(samples), n_nodes), dtype=torch.bool, device=self.device)
+            _, _, value_pred = self.nn_model(node_feats_t.repeat(len(samples), 1, 1), current_node=current_nodes, visited_mask=visited_mask, solution_routes=route_tensors)
+            value_loss_fn = nn.MSELoss()
+            # 规范化预测与目标
+            vloss = value_loss_fn(value_pred / ref, targets / ref)
+        except Exception:
+            vloss = torch.tensor(0.0, device=self.device)
+
+        # 2) Policy 网络的简单行为克隆损失（避免存储大量小张量，使用累加）
+        ce_loss_fn = nn.CrossEntropyLoss(reduction='mean')
+        policy_loss_acc = torch.tensor(0.0, device=self.device)
+        policy_count = 0
+
+        for i, s in enumerate(samples):
+            # build flattened customer sequence
+            seq = []
+            for r in s.routes:
+                for node in r:
+                    if node != 0:
+                        seq.append(int(node))
+            if not seq:
+                continue
+
+            visited = set([0])
+            for t_idx, nxt in enumerate(seq):
+                current = 0 if t_idx == 0 else seq[t_idx - 1]
+                current_tensor = torch.tensor([current], dtype=torch.long, device=self.device)
+                visited_mask_step = torch.zeros((1, n_nodes), dtype=torch.bool, device=self.device)
+                for v in visited:
+                    if v < n_nodes:
+                        visited_mask_step[0, int(v)] = True
+                try:
+                    # 前向只为单步得到 logits
+                    action_probs, action_logits = self.nn_model(node_feats_t.to(self.device), current_tensor, visited_mask_step)
+                    target = torch.tensor([nxt], dtype=torch.long, device=self.device)
+                    loss_step = ce_loss_fn(action_logits, target)
+                    policy_loss_acc = policy_loss_acc + loss_step
+                    policy_count += 1
+                except Exception:
+                    pass
+                visited.add(nxt)
+
+        if policy_count > 0:
+            policy_loss = policy_loss_acc / float(policy_count)
+        else:
+            policy_loss = torch.tensor(0.0, device=self.device)
+
+        total_loss = policy_loss + vloss
+        try:
+            total_loss.backward()
+            self.nn_optimizer.step()
+            self.nn_optimizer.zero_grad()
+        except Exception:
+            pass
+
+        # 如果使用 CUDA，主动释放缓存以降低峰值占用
+        try:
+            if self.device.type == 'cuda':
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+        # 返回标量损失
+        try:
+            return float(policy_loss.detach().cpu().item()), float(vloss.detach().cpu().item())
+        except Exception:
+            return 0.0, 0.0
 
     def fast_non_dominated_sort(self, population):
         if not population:
