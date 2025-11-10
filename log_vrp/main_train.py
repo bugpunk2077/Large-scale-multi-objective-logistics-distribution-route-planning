@@ -42,7 +42,7 @@ def main():
     # 配置参数
     config = {
         'population_size': 50,      # 种群大小
-        'max_generations': 200,      # 最大代数
+        'max_generations': 1000,      # 最大代数
         'hidden_dim': 64,           # 神经网络隐藏层维度
         'learning_rate': 0.001,     # 学习率
         'crossover_rate': 0.8,      # 交叉概率
@@ -51,6 +51,8 @@ def main():
         'train_interval': 20,       # 训练间隔（代）
         'min_vehicles': 5,
         'max_vehicles': 30,         # 车辆数量上下限
+        'verbose': True,
+        'print_interval': 10,
     }
 
     print("配置参数:")

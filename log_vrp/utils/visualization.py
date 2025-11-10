@@ -18,11 +18,16 @@ def plot_training_history(history, save_path=None, show=False):
         ax1.grid(True, alpha=0.3)
     
     # 绘制目标函数进化
-    if history['avg_objectives']:
-        objectives = np.array(history['avg_objectives'])
-        ax2.plot(objectives[:, 0], label='总距离')
-        ax2.plot(objectives[:, 1], label='最长路径时间')
-        ax2.plot(objectives[:, 2], label='车辆数')
+    if history.get('avg_objectives'):
+        try:
+            objectives = np.array(history['avg_objectives'])
+            if objectives.size and objectives.ndim == 2 and objectives.shape[1] >= 3:
+                ax2.plot(objectives[:, 0], label='总距离')
+                ax2.plot(objectives[:, 1], label='最长路径时间')
+                ax2.plot(objectives[:, 2], label='车辆数')
+        except Exception:
+            # 避免因空数组/NaN导致的 numpy 警告
+            pass
         ax2.set_xlabel('代数')
         ax2.set_ylabel('目标值')
         ax2.set_title('平均目标函数进化')
@@ -264,23 +269,48 @@ def plot_solution_routes(solution, problem, save_path=None, show=False, title_pr
             if node == 0:
                 continue
             try:
-                if 0 <= int(node) < len(problem.demands):
-                    load += float(problem.demands[int(node)])
+                ni = int(node)
+                if 0 <= ni < len(problem.demands):
+                    load += float(problem.demands[ni])
                 else:
                     invalid_indices.append(node)
             except Exception:
                 invalid_indices.append(node)
         route_loads.append(load)
+
+    # 计算负载统计（带保护）
+    non_empty_routes = [r for r in solution.routes if len(r) > 2]
+    total_load = sum(route_loads) if route_loads else 0.0
+    valid_loads = [load for load in route_loads if load is not None]
+    if non_empty_routes:
+        try:
+            avg_load = total_load / len(non_empty_routes)
+        except Exception:
+            avg_load = 0.0
+    else:
+        avg_load = 0.0
+
+    if valid_loads:
+        try:
+            load_std = float(np.nanstd(valid_loads))
+        except Exception:
+            load_std = 0.0
+    else:
+        load_std = 0.0
     
-    # 计算负载统计
-    total_load = sum(route_loads)
-    avg_load = total_load / len([r for r in solution.routes if len(r) > 2])
-    load_std = np.std([load for load in route_loads if load > 0])
-    
+    # 保护性访问 objectives
+    try:
+        dist_val = solution.objectives[0]
+        max_rt = solution.objectives[1]
+        veh_cnt = solution.objectives[2]
+    except Exception:
+        dist_val = max_rt = 0.0
+        veh_cnt = len(solution.routes)
+
     title = (f'{title_prefix}配送路径方案\n'
-             f'总距离: {solution.objectives[0]:.1f}, '
-             f'最长路径: {solution.objectives[1]:.1f}, '
-             f'车辆数: {solution.objectives[2]}\n'
+             f'总距离: {dist_val:.1f}, '
+             f'最长路径: {max_rt:.1f}, '
+             f'车辆数: {veh_cnt}\n'
              f'平均负载: {avg_load:.1f}, 负载标准差: {load_std:.1f}')
     ax.set_title(title)
     
