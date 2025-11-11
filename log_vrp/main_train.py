@@ -25,7 +25,7 @@ os.makedirs('results', exist_ok=True)
 os.makedirs('data', exist_ok=True)
 
 from models.gmoea import GMOEA
-from utils.data_loader import load_vrp_instance, VRPProblem
+from utils.data_loader import load_vrp_instance, VRPProblem, load_ground_truth
 from utils.evaluator import evaluate_solution_set
 from utils.visualization import (
     plot_training_history,
@@ -39,21 +39,72 @@ def main():
     print("基于神经网络的GMOEA物流配送路径规划 - 完整训练版本")
     print("=" * 70)
 
-    # 配置参数
-    config = {
-        'population_size': 10,      # 种群大小
-        'max_generations': 20,      # 最大代数
-        'hidden_dim': 64,           # 神经网络隐藏层维度
-        'learning_rate': 0.001,     # 学习率
-        'crossover_rate': 0.8,      # 交叉概率
-        'mutation_rate': 0.2,       # 变异概率
-        'batch_size': 8,            # 训练批量大小
-        'train_interval': 20,       # 训练间隔（代）
-        'min_vehicles': 5,
-        'max_vehicles': 30,         # 车辆数量上下限
-        'verbose': True,
-        'print_interval': 10,
+    # 参数调优方案：根据实例规模与收敛情况选择合适的配置档位
+    # 当前问题分析：700代稳定在1757.67，2000代仅微弱改进到1676.23（约5%）-> 早熟收敛、多样性丧失
+    # 对策：增加人口多样性、提高探索强度、强化局部搜索、避免早熟
+    
+    # 选择配置档位（可选择其中一个或自定义）
+    config_preset = 'conservative'  # 可选: 'conservative' / 'balanced' / 'aggressive'
+    
+    # 定义三个预设配置档位
+    config_presets = {
+        'conservative': {
+            # 适用于快速验证、小规模实验
+            # 目标：快速找到可行解，时间成本低
+            'population_size': 50,
+            'max_generations': 300,
+            'crossover_rate': 0.7,      # 较低交叉率以保持多样性
+            'mutation_rate': 0.3,       # 较高变异率增加探索
+            'local_search_freq': 1,     # 每代执行一次局部搜索（轻量化）
+            'local_search_depth': 'light',  # 'light' (2-opt仅)  / 'medium' / 'heavy'
+        },
+        'balanced': {
+            # 适用于中等规模VRPTW实例（100个客户左右）
+            # 目标：平衡探索与开发，在合理时间内得到近优解
+            'population_size': 150,
+            'max_generations': 1000,
+            'crossover_rate': 0.75,     # 中等交叉率
+            'mutation_rate': 0.35,      # 增强变异以抵抗早熟
+            'local_search_freq': 2,     # 每2代执行一次局部搜索
+            'local_search_depth': 'medium',  # 2-opt + 路径合并
+        },
+        'aggressive': {
+            # 适用于寻求最优解、计算资源充足的情况
+            # 目标：深度优化，尽可能接近全局最优
+            'population_size': 300,
+            'max_generations': 3000,
+            'crossover_rate': 0.8,      # 中等偏高交叉率
+            'mutation_rate': 0.4,       # 最高变异率，持续引入新血
+            'local_search_freq': 1,     # 每代执行局部搜索（高强度）
+            'local_search_depth': 'heavy',  # 完整2-opt + 激进路径合并 + 邻域重构
+        },
     }
+    
+    # 使用预设或自定义
+    config = {
+        **config_presets[config_preset],
+        'hidden_dim': 64,
+        'learning_rate': 0.001,
+        'batch_size': 16,
+        'train_interval': 5,
+        # 行为克隆（BC）预训练选项：当为 True 且存在同名 .sol 文件时，先进行监督预训练
+        'use_behavior_cloning': True,
+        'bc_epochs': 10,
+        'bc_batch_size': 8,
+        'min_vehicles': 5,
+        'max_vehicles': 30,
+        'balance_strategy': 'min_vehicles',
+        'use_nn': False,
+        'verbose': True,
+        'print_interval': 50,  # 每50代打印一次（减少输出）
+    }
+    
+    print(f"\n使用配置档位: {config_preset}")
+    print(f"参数调优说明:")
+    print(f"  - population_size: {config['population_size']} (更大的人口增加多样性，探索更广的解空间)")
+    print(f"  - max_generations: {config['max_generations']} (更多代数允许更深度的搜索)")
+    print(f"  - mutation_rate: {config['mutation_rate']} (更高变异率延缓收敛速度，避免早熟)")
+    print(f"  - local_search_freq: {config.get('local_search_freq', 2)} (更频繁的局部搜索加速收敛)\n")
 
     print("配置参数:")
     for key, value in config.items():
@@ -87,7 +138,27 @@ def main():
             base = os.path.splitext(os.path.basename(fp))[0]
 
         print("\n初始化GMOEA算法...")
+        # 如果配置中要求行为克隆预训练，则先启用 NN
+        if config.get('use_behavior_cloning', False):
+            config['use_nn'] = True
         algorithm = GMOEA(problem, config)
+
+        # 若启用行为克隆并且存在同名 .sol 文件，则载入并执行预训练
+        if config.get('use_behavior_cloning', False):
+            sol_path = os.path.join('data', f"{base}.sol")
+            if os.path.exists(sol_path):
+                print(f"检测到监督解文件: {sol_path}，开始行为克隆预训练 ({config.get('bc_epochs')} epochs)")
+                sols = load_ground_truth(sol_path)
+                routes = sols.get(base)
+                if routes:
+                    try:
+                        algorithm.train_supervised(routes, epochs=config.get('bc_epochs', 10), batch_size=config.get('bc_batch_size', 8))
+                    except Exception as e:
+                        print(f"行为克隆训练失败: {e}")
+                else:
+                    print(f"未能从 {sol_path} 解析到路线，跳过 BC 预训练。")
+            else:
+                print(f"配置要求行为克隆但未找到 {sol_path}，跳过 BC 预训练。")
 
         print("开始训练...")
         start_time = time.time()

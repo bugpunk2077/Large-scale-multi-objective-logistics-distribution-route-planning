@@ -62,6 +62,9 @@ class GMOEA:
         self.crossover_rate = float(self.config.get('crossover_rate', 0.8))
         self.mutation_rate = float(self.config.get('mutation_rate', 0.2))
         self.train_interval = int(self.config.get('train_interval', 20))
+        # 局部搜索配置（防止早熟收敛）
+        self.local_search_freq = int(self.config.get('local_search_freq', 2))  # 每N代执行一次
+        self.local_search_depth = self.config.get('local_search_depth', 'heavy')  # 'light' / 'medium' / 'heavy'
         # 输出与打印控制
         self.verbose = bool(self.config.get('verbose', True))
         self.print_interval = int(self.config.get('print_interval', 10))
@@ -143,7 +146,9 @@ class GMOEA:
                 self.training_history['value_loss'].append(0.0)
 
             # 产生子代并选择下一代
-            offspring = self.evolve_population(population)
+            # 按 local_search_freq 决定是否对子代应用局部搜索
+            apply_local_search = (gen % self.local_search_freq == 0)
+            offspring = self.evolve_population(population, apply_local_search=apply_local_search)
             combined = population + offspring
             fronts = self.fast_non_dominated_sort(combined)
             new_pop = []
@@ -178,6 +183,7 @@ class GMOEA:
         except Exception:
             pass
 
+
         # 填充：最近邻、随机与（可选）神经网络混合
         while len(population) < self.population_size:
             if self.use_nn and random.random() < 0.3:
@@ -189,6 +195,7 @@ class GMOEA:
                 routes = self.nearest_neighbor_solution()
             else:
                 routes = self.generate_random_solution()
+            # 仅在需要时对路由做平衡/打包；balance_strategy 控制是均匀分配还是尽量压缩车辆数
             routes = self.balance_routes(routes)
             s = Solution(routes)
             s.evaluate(self.problem)
@@ -303,7 +310,7 @@ class GMOEA:
             routes.append(cur)
         return routes
 
-    def evolve_population(self, population):
+    def evolve_population(self, population, apply_local_search=True):
         offspring = []
         target = max(1, self.population_size // 2)
         while len(offspring) < target:
@@ -315,7 +322,7 @@ class GMOEA:
                 child_routes = [r.copy() for r in p1.routes]
             if random.random() < self.mutation_rate:
                 child_routes = self.simple_mutation(child_routes)
-            child_routes = self.repair_routes(child_routes)
+            child_routes = self.repair_routes(child_routes, apply_local_search=apply_local_search)
             child = Solution(child_routes)
             child.evaluate(self.problem)
             offspring.append(child)
@@ -369,7 +376,7 @@ class GMOEA:
         routes[r1][p1], routes[r2][p2] = routes[r2][p2], routes[r1][p1]
         return routes
 
-    def repair_routes(self, routes):
+    def repair_routes(self, routes, apply_local_search=True):
         all_customers = set(range(1, self.problem.num_customers + 1))
         assigned = set()
         cleaned = []
@@ -384,49 +391,193 @@ class GMOEA:
                 cleaned.append(nr)
         for m in sorted(all_customers - assigned):
             cleaned.append([0, m, 0])
-        # 最后做一次平衡，尝试让车辆分配更均匀且不超过车辆上限
-        return self.balance_routes(cleaned)
+        
+        # 局部搜索：根据配置深度和频率应用
+        if apply_local_search:
+            improved = self.local_search(cleaned, depth=self.local_search_depth)
+        else:
+            improved = cleaned
+        
+        # 最后做一次平衡/打包
+        return self.balance_routes(improved)
+
+    def two_opt(self, route):
+        """对单条路径执行 2-opt 局部搜索以减少距离。route 为包含 0 起止的节点列表。"""
+        if len(route) <= 4:
+            return route
+        best = route[:]
+        improved = True
+        while improved:
+            improved = False
+            for i in range(1, len(best) - 2):
+                for j in range(i + 1, len(best) - 1):
+                    if j - i == 1:
+                        continue
+                    newr = best[:i] + best[i:j+1][::-1] + best[j+1:]
+                    # 计算两者距离
+                    def route_dist(r):
+                        d = 0.0
+                        for a, b in zip(r[:-1], r[1:]):
+                            d += self.problem.distance_matrix[a][b]
+                        return d
+                    if route_dist(newr) + 1e-6 < route_dist(best):
+                        best = newr
+                        improved = True
+                        break
+                if improved:
+                    break
+        return best
+
+    def local_search(self, routes, depth='medium'):
+        """对一组 routes 执行局部改进。depth 控制搜索强度：
+        - 'light': 仅执行单轮 2-opt，不做合并
+        - 'medium': 执行 2-opt + 基本合并（每两条路径尝试一次）
+        - 'heavy': 执行完整 2-opt + 激进合并（多轮迭代）+ 邻域重构
+        """
+        # 先对每条路径做 2-opt（所有深度都执行）
+        routes = [self.two_opt(r) for r in routes]
+        
+        if depth == 'light':
+            # 仅做 2-opt，不做合并
+            return routes
+        
+        # 'medium' 和 'heavy' 都尝试合并
+        if depth == 'medium':
+            # 基本合并：一轮迭代
+            routes = self._merge_routes_once(routes)
+        elif depth == 'heavy':
+            # 激进合并：多轮迭代 + 重试
+            for _ in range(3):  # 最多三轮迭代
+                old_len = len(routes)
+                routes = self._merge_routes_once(routes)
+                if len(routes) == old_len:
+                    break  # 无法再合并，退出
+        
+        return routes
+    
+    def _merge_routes_once(self, routes):
+        """尝试一次合并两条路径。"""
+        merged = True
+        while merged:
+            merged = False
+            best_gain = 0.0
+            best_pair = None
+            for i in range(len(routes)):
+                for j in range(i + 1, len(routes)):
+                    r1 = routes[i]
+                    r2 = routes[j]
+                    load1 = sum(self.problem.demands[n] for n in r1 if n != 0)
+                    load2 = sum(self.problem.demands[n] for n in r2 if n != 0)
+                    if load1 + load2 > self.problem.vehicle_capacity:
+                        continue
+                    # 尝试简单连接 r1[:-1] + r2[1:]
+                    cand = r1[:-1] + r2[1:]
+                    # 计算距离差
+                    def dist_of(r):
+                        s = 0.0
+                        for a, b in zip(r[:-1], r[1:]):
+                            s += self.problem.distance_matrix[a][b]
+                        return s
+                    old = dist_of(r1) + dist_of(r2)
+                    new = dist_of(cand)
+                    gain = old - new
+                    if gain > best_gain + 1e-6:
+                        best_gain = gain
+                        best_pair = (i, j, cand)
+            if best_pair is not None:
+                i, j, cand = best_pair
+                if i < j:
+                    del routes[j]
+                    del routes[i]
+                else:
+                    del routes[i]
+                    del routes[j]
+                routes.append(cand)
+                merged = True
+        return routes
 
     def balance_routes(self, routes):
-        """把客户均匀分配到不超过 problem.num_vehicles 的车辆上，尽量满足容量约束。
+        """打包/平衡路径。
 
-        算法：将所有客户摊平，然后轮询到 num_vehicles 个车上（尝试尊重容量），
-        如果某个客户无法放入任何车（容量不足的极端情况），则会创建额外车道。
+        balance_strategy: 可选 'even' 或 'min_vehicles'。
+        - 'even' (原有行为)：将客户轮询分配到 problem.num_vehicles 个车上，得到较均匀分布（但可能使用更多车辆）。
+        - 'min_vehicles' (默认)：先按需求降序进行 First-Fit 填充，尽量使用更少车辆（遵守 vehicle_capacity），在达到上限时才创建更多车辆。
+        返回值为带 0 起止的路径列表。
         """
         if not routes:
             return []
-        customers = [c for r in routes for c in r if c != 0]
-        num_v = int(getattr(self.problem, 'num_vehicles', max(1, len(routes))))
-        if num_v <= 0:
-            num_v = 1
 
-        new_routes = [[0] for _ in range(num_v)]
-        loads = [0.0 for _ in range(num_v)]
-        idx = 0
-        for c in customers:
+        strategy = self.config.get('balance_strategy', 'min_vehicles')
+        customers = [c for r in routes for c in r if c != 0]
+        max_v = int(getattr(self.problem, 'num_vehicles', max(1, len(routes))))
+
+        if strategy == 'even':
+            # 保持原有轮询分配逻辑
+            if max_v <= 0:
+                max_v = 1
+            new_routes = [[0] for _ in range(max_v)]
+            loads = [0.0 for _ in range(max_v)]
+            idx = 0
+            for c in customers:
+                d = float(self.problem.demands[c])
+                placed = False
+                for attempt in range(max_v):
+                    j = (idx + attempt) % max_v
+                    if loads[j] + d <= self.problem.vehicle_capacity:
+                        new_routes[j].append(c)
+                        loads[j] += d
+                        placed = True
+                        idx = (j + 1) % max_v
+                        break
+                if not placed:
+                    new_routes.append([0, c])
+                    loads.append(d)
+                    idx = len(new_routes) - 1
+            final = []
+            for r in new_routes:
+                if len(r) > 1:
+                    r.append(0)
+                    final.append(r)
+            return final
+
+        # 默认：min_vehicles -> First-Fit Decreasing (FFD) based on demands
+        # 将客户按 demand 降序排序以便先放大需求
+        try:
+            cust_sorted = sorted(customers, key=lambda c: -float(self.problem.demands[c]))
+        except Exception:
+            cust_sorted = customers[:]
+
+        new_routes = []  # 每项为不含 depot 的客户列表
+        loads = []
+        for c in cust_sorted:
             d = float(self.problem.demands[c])
             placed = False
-            # 尝试从当前索引开始循环寻找能放下的车
-            for attempt in range(num_v):
-                j = (idx + attempt) % num_v
-                if loads[j] + d <= self.problem.vehicle_capacity:
-                    new_routes[j].append(c)
-                    loads[j] += d
+            # 尝试把客户放入已有车队（先找到第一个能放下的）
+            for i, load in enumerate(loads):
+                if load + d <= self.problem.vehicle_capacity:
+                    new_routes[i].append(c)
+                    loads[i] += d
                     placed = True
-                    idx = (j + 1) % num_v
                     break
             if not placed:
-                # 无法放入任何现有车辆（可能容量太小），新建一条车道来容纳
-                new_routes.append([0, c])
-                loads.append(d)
-                idx = len(new_routes) - 1
+                if len(new_routes) < max_v:
+                    new_routes.append([c])
+                    loads.append(d)
+                else:
+                    # 已达车辆上限，尽量放入负载最小的车（可能会超过容量）
+                    min_i = int(np.argmin(loads)) if loads else 0
+                    if loads:
+                        new_routes[min_i].append(c)
+                        loads[min_i] += d
+                    else:
+                        new_routes.append([c])
+                        loads.append(d)
 
-        # 关闭路径 (append depot end) 并移除空路径
+        # 格式化成带 depot 的路径
         final = []
         for r in new_routes:
-            if len(r) > 1:
-                r.append(0)
-                final.append(r)
+            if r:
+                final.append([0] + r + [0])
         return final
 
     # ----------------- 神经网络相关辅助方法 -----------------
@@ -500,6 +651,7 @@ class GMOEA:
             # 为 value 前向准备批次的 current_node 与 visited_mask
             current_nodes = torch.zeros((len(samples),), dtype=torch.long, device=self.device)
             visited_mask = torch.zeros((len(samples), n_nodes), dtype=torch.bool, device=self.device)
+            # 使用 repeat 临时创建 batch 视图 —— 对小规模 batch 是可接受的
             _, _, value_pred = self.nn_model(node_feats_t.repeat(len(samples), 1, 1), current_node=current_nodes, visited_mask=visited_mask, solution_routes=route_tensors)
             value_loss_fn = nn.MSELoss()
             # 规范化预测与目标
@@ -511,6 +663,8 @@ class GMOEA:
         ce_loss_fn = nn.CrossEntropyLoss(reduction='mean')
         policy_loss_acc = torch.tensor(0.0, device=self.device)
         policy_count = 0
+        # 限制单次训练中 policy 前向的最大步数，防止初始代时大量短路展开造成尖峰
+        max_policy_steps = int(self.config.get('policy_max_steps', 200))
 
         for i, s in enumerate(samples):
             # build flattened customer sequence
@@ -532,7 +686,8 @@ class GMOEA:
                         visited_mask_step[0, int(v)] = True
                 try:
                     # 前向只为单步得到 logits
-                    action_probs, action_logits = self.nn_model(node_feats_t.to(self.device), current_tensor, visited_mask_step)
+                    # node_feats_t 已在 device 上，无需额外拷贝
+                    action_probs, action_logits = self.nn_model(node_feats_t, current_tensor, visited_mask_step)
                     target = torch.tensor([nxt], dtype=torch.long, device=self.device)
                     loss_step = ce_loss_fn(action_logits, target)
                     policy_loss_acc = policy_loss_acc + loss_step
@@ -540,6 +695,11 @@ class GMOEA:
                 except Exception:
                     pass
                 visited.add(nxt)
+                # 如果已达到最大 policy 步数，跳出所有循环以限制计算量
+                if policy_count >= max_policy_steps:
+                    break
+            if policy_count >= max_policy_steps:
+                break
 
         if policy_count > 0:
             policy_loss = policy_loss_acc / float(policy_count)
@@ -566,6 +726,110 @@ class GMOEA:
             return float(policy_loss.detach().cpu().item()), float(vloss.detach().cpu().item())
         except Exception:
             return 0.0, 0.0
+
+    def train_supervised(self, ground_truth_routes, epochs=5, batch_size=8):
+        """使用给定的 ground-truth 路线列表对 policy 网络做行为克隆预训练。
+
+        参数:
+          ground_truth_routes: List[List[List[int]]] 或者单一 List[List[int]]（每个路由为 [0,a,b,0]）
+          epochs: 训练轮数
+          batch_size: 每批样本数量（按解计）
+        返回: 无（在控制台打印每 epoch loss）
+        """
+        if not self.use_nn or self.nn_model is None or self.nn_optimizer is None:
+            print("NN 未启用或未初始化，跳过监督预训练。")
+            return
+
+        # 统一输入格式：列表的列表（每个元素是一个解：List[routes])
+        dataset = []
+        if isinstance(ground_truth_routes, dict):
+            # dict of instance->routes_list: flatten values
+            for v in ground_truth_routes.values():
+                if isinstance(v, list):
+                    # 如果 v 是 routes 列表（List[List[int]]），把它作为一个样本
+                    dataset.append(v)
+        elif isinstance(ground_truth_routes, list):
+            # 判断是单个解（list of routes) 还是多解的集合
+            if ground_truth_routes and isinstance(ground_truth_routes[0], list) and ground_truth_routes and isinstance(ground_truth_routes[0][0] if ground_truth_routes[0] else [], list):
+                # list of solutions
+                dataset = ground_truth_routes
+            else:
+                # single solution (list of routes)
+                dataset = [ground_truth_routes]
+        else:
+            print("Unsupported ground_truth_routes format")
+            return
+
+        if not dataset:
+            print("没有找到可用的监督样本，跳过预训练。")
+            return
+
+        node_feats = self._build_node_features()
+        n_nodes = node_feats.shape[0]
+        node_feats_t = torch.tensor(node_feats, dtype=torch.float32, device=self.device).unsqueeze(0)
+
+        ce_loss_fn = nn.CrossEntropyLoss(reduction='mean')
+
+        for ep in range(int(epochs)):
+            random.shuffle(dataset)
+            total_loss = 0.0
+            batches = 0
+            for i in range(0, len(dataset), batch_size):
+                batch = dataset[i:i + batch_size]
+                self.nn_model.train()
+                self.nn_optimizer.zero_grad()
+                batch_loss = torch.tensor(0.0, device=self.device)
+                sample_count = 0
+                for routes in batch:
+                    # flatten sequence of customers (exclude depot)
+                    seq = []
+                    for r in routes:
+                        for n in r:
+                            if n != 0:
+                                seq.append(int(n))
+                    if not seq:
+                        continue
+                    visited = set([0])
+                    for t_idx, nxt in enumerate(seq):
+                        current = 0 if t_idx == 0 else seq[t_idx - 1]
+                        current_tensor = torch.tensor([current], dtype=torch.long, device=self.device)
+                        visited_mask_step = torch.zeros((1, n_nodes), dtype=torch.bool, device=self.device)
+                        for v in visited:
+                            if v < n_nodes:
+                                visited_mask_step[0, int(v)] = True
+                        try:
+                            out = self.nn_model(node_feats_t, current_tensor, visited_mask_step)
+                            # 支持两种返回格式：(probs, logits) 或 (probs, logits, value)
+                            if isinstance(out, tuple) or isinstance(out, list):
+                                if len(out) >= 2:
+                                    action_logits = out[1]
+                                else:
+                                    action_logits = out[0]
+                            else:
+                                action_logits = out
+                            target = torch.tensor([nxt], dtype=torch.long, device=self.device)
+                            loss_step = ce_loss_fn(action_logits, target)
+                            batch_loss = batch_loss + loss_step
+                            sample_count += 1
+                        except Exception:
+                            # 忽略单步失败
+                            pass
+                        visited.add(nxt)
+
+                if sample_count > 0:
+                    batch_loss = batch_loss / float(max(1, sample_count))
+                    try:
+                        batch_loss.backward()
+                        self.nn_optimizer.step()
+                    except Exception:
+                        pass
+                    total_loss += float(batch_loss.detach().cpu().item())
+                    batches += 1
+
+            avg_loss = total_loss / max(1, batches)
+            print(f"BC epoch {ep+1}/{int(epochs)} avg_loss={avg_loss:.6f}")
+            # 记录到训练历史以便可视化
+            self.training_history.setdefault('bc_loss', []).append(float(avg_loss))
 
     def fast_non_dominated_sort(self, population):
         if not population:

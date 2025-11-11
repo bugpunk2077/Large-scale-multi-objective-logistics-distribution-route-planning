@@ -1,5 +1,6 @@
 import numpy as np
 import os
+import re
 
 
 class VRPProblem:
@@ -35,32 +36,39 @@ class VRPProblem:
 
     def _load_tab_separated(self, file_path):
         with open(file_path, 'r', encoding='utf-8') as f:
-            lines = [l.rstrip('\n') for l in f if l.strip()]
+            raw = [l.rstrip('\n') for l in f]
+        # 移除空白行但保留原始以便格式检测
+        lines = [l for l in raw if l.strip()]
 
         if not lines:
             raise ValueError('文件为空')
 
-        # 尝试解析首行配置（如果为数字项）
-        first_tokens = lines[0].split('\t')
-        if len(first_tokens) >= 3:
-            try:
-                nv = int(first_tokens[0])
-                cap = float(first_tokens[1])
-                spd = float(first_tokens[2])
-                # 仅在合理范围内才替换默认值
-                if nv > 0:
-                    self.num_vehicles = nv
-                if cap > 0:
-                    self.vehicle_capacity = cap
-                if spd > 0:
-                    self.vehicle_speed = spd
-                # 把首行当配置行解析后，从第二行开始解析节点
-                data_lines = lines[1:]
-            except Exception:
-                # 如果解析失败，则把所有行视为数据行
-                data_lines = lines
+        # 若文件为经典 VRPTW 格式（含关键词 VEHICLE / CUSTOMER），则使用专门解析器
+        up = '\n'.join(raw).upper()
+        if 'VEHICLE' in up and 'CUSTOMER' in up:
+            data_lines = self._parse_vrptw(raw)
         else:
-            data_lines = lines
+            # 尝试解析首行配置（如果为数字项）
+            first_tokens = lines[0].split('\t')
+            if len(first_tokens) >= 3:
+                try:
+                    nv = int(first_tokens[0])
+                    cap = float(first_tokens[1])
+                    spd = float(first_tokens[2])
+                    # 仅在合理范围内才替换默认值
+                    if nv > 0:
+                        self.num_vehicles = nv
+                    if cap > 0:
+                        self.vehicle_capacity = cap
+                    if spd > 0:
+                        self.vehicle_speed = spd
+                    # 把首行当配置行解析后，从第二行开始解析节点
+                    data_lines = lines[1:]
+                except Exception:
+                    # 如果解析失败，则把所有行视为数据行
+                    data_lines = lines
+            else:
+                data_lines = lines
 
         # 解析数据行：id x y demand earliest latest service [pickup] [delivery]
         self.coordinates = []
@@ -133,6 +141,67 @@ class VRPProblem:
         self.distance_matrix = self.calculate_distance_matrix()
         print(f"已加载 VRP: nodes={len(self.coordinates)} customers={self.num_customers} vehicles_limit={self.num_vehicles} capacity={self.vehicle_capacity}")
 
+    def _parse_vrptw(self, raw_lines):
+        """解析经典 VRPTW 文件格式，返回仅含节点数据行的列表（用制表符分隔或空格分隔的字段）。
+
+        支持的段落：VEHICLE 部分包含 NUMBER 和 CAPACITY；
+        CUSTOMER 段包含表头，然后每行为: id x y demand ready_time due_date service_time
+        返回值：节点行的字符串列表（字段用 '\t' 分隔以兼容后续逻辑）
+        """
+        lines = [l.strip() for l in raw_lines if l.strip()]
+        num_vehicles = None
+        vehicle_capacity = None
+        cust_lines = []
+        mode = None
+        for ln in lines:
+            up = ln.upper()
+            if up.startswith('VEHICLE'):
+                mode = 'VEHICLE'
+                continue
+            if up.startswith('CUSTOMER'):
+                mode = 'CUSTOMER'
+                continue
+            # VEHICLE 段可能包含字段名或直接数字行
+            if mode == 'VEHICLE':
+                # 尝试从行中提取两个数字：K Q
+                parts = ln.replace('\t', ' ').split()
+                nums = [p for p in parts if all(ch.isdigit() or ch in '.-+' for ch in p)]
+                if len(nums) >= 2:
+                    try:
+                        if num_vehicles is None:
+                            num_vehicles = int(float(nums[0]))
+                        if vehicle_capacity is None:
+                            vehicle_capacity = float(nums[1])
+                    except Exception:
+                        pass
+                continue
+            if mode == 'CUSTOMER':
+                # 忽略可能的 header 行（包含字母）
+                if any(c.isalpha() for c in ln) and not ln[0].isdigit():
+                    continue
+                # 将空白/多个空格或制表符统一为单个制表符，返回给上层解析
+                parts = ln.replace('\t', ' ').split()
+                if len(parts) >= 7:
+                    # 取前 7 字段
+                    row = '\t'.join(parts[:7])
+                    cust_lines.append(row)
+                else:
+                    # 忽略非数据行
+                    continue
+
+        if num_vehicles is not None:
+            try:
+                self.num_vehicles = int(num_vehicles)
+            except Exception:
+                pass
+        if vehicle_capacity is not None:
+            try:
+                self.vehicle_capacity = float(vehicle_capacity)
+            except Exception:
+                pass
+
+        return cust_lines
+
     def generate_example_data(self):
         print('使用示例数据 (PDPTW)')
         self.num_customers = 100
@@ -194,3 +263,81 @@ class VRPProblem:
 
 def load_vrp_instance(file_path):
     return VRPProblem(file_path)
+
+
+def load_ground_truth(path_or_dir):
+    """加载 .sol 最优解文件或目录。
+
+    返回字典：{base_name: routes_list}
+    每个 routes_list 是 [[0, a, b, 0], [0, c, d, 0], ...]
+    兼容单文件和目录输入；在无法解析时返回 {}。
+    """
+    sols = {}
+    if not path_or_dir:
+        return sols
+    files = []
+    if os.path.isdir(path_or_dir):
+        for fn in os.listdir(path_or_dir):
+            if fn.lower().endswith('.sol'):
+                files.append(os.path.join(path_or_dir, fn))
+    elif os.path.isfile(path_or_dir):
+        files = [path_or_dir]
+    else:
+        # 如果传入的是路径前缀（如 data/base），尝试附加 .sol
+        if os.path.exists(path_or_dir + '.sol'):
+            files = [path_or_dir + '.sol']
+        else:
+            return sols
+
+    for fp in files:
+        try:
+            with open(fp, 'r', encoding='utf-8') as f:
+                lines = [ln.strip() for ln in f.readlines() if ln.strip()]
+        except Exception:
+            continue
+
+        routes = []
+        # 每行尝试解析一条路线中的整数序列
+        for ln in lines:
+            nums = re.findall(r"-?\d+", ln)
+            if not nums:
+                continue
+            nums = [int(x) for x in nums]
+            # 保留非负索引
+            nums = [n for n in nums if n >= 0]
+            if not nums:
+                continue
+            # 确保以 0 起止
+            if nums[0] != 0:
+                nums = [0] + nums
+            if nums[-1] != 0:
+                nums = nums + [0]
+            # 忽略仅 depot 的线路
+            if len(nums) <= 2:
+                continue
+            routes.append(nums)
+
+        # 如果逐行未能解析到多条路线，尝试把文件中所有数字作为一条序列并切分
+        if not routes:
+            all_nums = []
+            for ln in lines:
+                parts = re.findall(r"\d+", ln)
+                all_nums.extend(int(p) for p in parts)
+            if all_nums:
+                if all_nums[0] != 0:
+                    all_nums = [0] + all_nums
+                if all_nums[-1] != 0:
+                    all_nums = all_nums + [0]
+                cur = []
+                for n in all_nums:
+                    if n == 0:
+                        if cur:
+                            routes.append([0] + cur + [0])
+                            cur = []
+                    else:
+                        cur.append(n)
+
+        base = os.path.splitext(os.path.basename(fp))[0]
+        sols[base] = routes
+
+    return sols
