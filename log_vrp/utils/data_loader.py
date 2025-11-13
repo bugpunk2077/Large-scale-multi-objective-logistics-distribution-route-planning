@@ -341,3 +341,57 @@ def load_ground_truth(path_or_dir):
         sols[base] = routes
 
     return sols
+
+
+def compute_kmeans(coordinates, k=4, max_iter=100, tol=1e-4, random_state=None):
+    """简单的 K-means 实现（只依赖 numpy），用于把节点坐标聚类。
+
+    参数:
+      coordinates: iterable of (x,y) tuples
+      k: 聚类数
+      max_iter: 最大迭代次数
+      tol: 收敛容忍度（质心移动小于 tol 时停止）
+      random_state: 可选 int（用于可重复初始化）
+
+    返回: (labels, centers)
+      labels: numpy array shape (n,) 每个点的簇索引
+      centers: numpy array shape (k,2)
+    """
+    import numpy as _np
+
+    pts = _np.array(coordinates, dtype=float)
+    n = pts.shape[0]
+    if n == 0:
+        return _np.array([]), _np.zeros((0, 2))
+
+    if k <= 0:
+        raise ValueError('k must be > 0')
+
+    rng = _np.random.RandomState(random_state)
+    # 随机选择初始质心
+    init_idx = rng.choice(n, min(k, n), replace=False)
+    centers = pts[init_idx].astype(float)
+
+    labels = _np.zeros(n, dtype=int)
+    for it in range(int(max_iter)):
+        # 分配步骤
+        dists = _np.sqrt(((pts[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2))  # (n,k)
+        new_labels = _np.argmin(dists, axis=1)
+
+        # 更新步骤
+        new_centers = _np.zeros_like(centers)
+        for j in range(centers.shape[0]):
+            members = pts[new_labels == j]
+            if len(members) == 0:
+                # 若某簇为空，重新随机选一个点作为中心
+                new_centers[j] = pts[rng.randint(0, n)]
+            else:
+                new_centers[j] = members.mean(axis=0)
+
+        shift = _np.sqrt(((new_centers - centers) ** 2).sum(axis=1)).max()
+        centers = new_centers
+        labels = new_labels
+        if shift <= tol:
+            break
+
+    return labels, centers

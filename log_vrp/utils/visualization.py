@@ -58,38 +58,19 @@ def plot_pareto_front(pareto_front, save_path=None, show=False):
         return
         
     objectives = np.array([sol.objectives for sol in pareto_front])
-    
-    fig = plt.figure(figsize=(15, 5))
-    
-    # 3D散点图
-    ax1 = fig.add_subplot(131, projection='3d')
-    scatter = ax1.scatter(objectives[:, 0], objectives[:, 1], objectives[:, 2],
-                         c=objectives[:, 0], cmap='viridis', alpha=0.7)
-    ax1.set_xlabel('总距离')
-    ax1.set_ylabel('最长路径时间')
-    ax1.set_zlabel('车辆数')
-    ax1.set_title('三维Pareto前沿')
-    
-    # 2D投影 - 距离 vs 时间
-    ax2 = fig.add_subplot(132)
-    scatter2 = ax2.scatter(objectives[:, 0], objectives[:, 1], 
-                          c=objectives[:, 2], cmap='viridis', alpha=0.7)
-    ax2.set_xlabel('总距离')
-    ax2.set_ylabel('最长路径时间')
-    ax2.set_title('总距离 vs 最长路径时间')
-    plt.colorbar(scatter2, ax=ax2, label='车辆数')
-    
+
+    fig = plt.figure(figsize=(10, 5))
+
     # 2D投影 - 距离 vs 车辆
-    ax3 = fig.add_subplot(133)
-    scatter3 = ax3.scatter(objectives[:, 0], objectives[:, 2], 
-                          c=objectives[:, 1], cmap='plasma', alpha=0.7)
-    ax3.set_xlabel('总距离')
-    ax3.set_ylabel('车辆数')
-    ax3.set_title('总距离 vs 车辆数')
-    plt.colorbar(scatter3, ax=ax3, label='最长路径时间')
-    
+    ax = fig.add_subplot(111)
+    scatter = ax.scatter(objectives[:, 0], objectives[:, 1], cmap='viridis', alpha=0.7)
+    ax.set_xlabel('总距离')
+    ax.set_ylabel('车辆数')
+    ax.set_title('总距离 vs 车辆数')
+    plt.colorbar(scatter, ax=ax, label='Pareto解')
+
     plt.tight_layout()
-    
+
     if save_path:
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         print(f"Pareto前沿图已保存至: {save_path}")
@@ -115,32 +96,26 @@ def plot_combined_pareto_fronts(pareto_dict, save_path=None, show=False):
         print("没有Pareto解可可视化")
         return
 
-    fig = plt.figure(figsize=(15, 5))
-    ax1 = fig.add_subplot(131, projection='3d')
-    ax2 = fig.add_subplot(132)
-    ax3 = fig.add_subplot(133)
+    # 目前为双目标（总距离, 车辆数）: 绘制单张 2D 图即可，用颜色区分不同实例
+    fig = plt.figure(figsize=(10, 6))
+    ax = fig.add_subplot(111)
 
     cmap = plt.get_cmap('tab10')
     for i, (name, objs) in enumerate(all_objs):
         color = cmap(i % 10)
-        ax1.scatter(objs[:, 0], objs[:, 1], objs[:, 2], c=[color], label=name, alpha=0.7)
-        ax2.scatter(objs[:, 0], objs[:, 1], c=[color], label=name, alpha=0.7)
-        ax3.scatter(objs[:, 0], objs[:, 2], c=[color], label=name, alpha=0.7)
+        # 保护性：确保 objs 至少有 2 列
+        if objs.ndim == 1:
+            xs = objs[0:1]
+            ys = objs[1:2] if objs.shape[0] > 1 else np.zeros_like(xs)
+        else:
+            xs = objs[:, 0]
+            ys = objs[:, 1] if objs.shape[1] > 1 else np.zeros(len(xs))
+        ax.scatter(xs, ys, c=[color], label=name, alpha=0.7)
 
-    ax1.set_xlabel('总距离')
-    ax1.set_ylabel('最长路径时间')
-    ax1.set_zlabel('车辆数')
-    ax1.set_title('合并三维Pareto前沿')
-
-    ax2.set_xlabel('总距离')
-    ax2.set_ylabel('最长路径时间')
-    ax2.set_title('总距离 vs 最长路径时间')
-
-    ax3.set_xlabel('总距离')
-    ax3.set_ylabel('车辆数')
-    ax3.set_title('总距离 vs 车辆数')
-
-    ax2.legend()
+    ax.set_xlabel('总距离')
+    ax.set_ylabel('车辆数')
+    ax.set_title('合并 Pareto 前沿（总距离 vs 车辆数）')
+    ax.legend()
     plt.tight_layout()
 
     if save_path:
@@ -298,18 +273,18 @@ def plot_solution_routes(solution, problem, save_path=None, show=False, title_pr
     else:
         load_std = 0.0
     
-    # 保护性访问 objectives
+    # 保护性访问 objectives（双目标：distance, vehicles）
     try:
-        dist_val = solution.objectives[0]
-        max_rt = solution.objectives[1]
-        veh_cnt = solution.objectives[2]
+        dist_val = float(solution.objectives[0]) if len(solution.objectives) > 0 else 0.0
     except Exception:
-        dist_val = max_rt = 0.0
+        dist_val = 0.0
+    try:
+        veh_cnt = int(solution.objectives[1]) if len(solution.objectives) > 1 else len(solution.routes)
+    except Exception:
         veh_cnt = len(solution.routes)
 
     title = (f'{title_prefix}配送路径方案\n'
              f'总距离: {dist_val:.1f}, '
-             f'最长路径: {max_rt:.1f}, '
              f'车辆数: {veh_cnt}\n'
              f'平均负载: {avg_load:.1f}, 负载标准差: {load_std:.1f}')
     ax.set_title(title)

@@ -36,7 +36,8 @@ from utils.visualization import (
 )
 
 def main():
-    print("基于神经网络的GMOEA物流配送路径规划 - 完整训练版本")
+    print("基于神经网络的GMOEA物流配送路径规划 - 双目标版本")
+    print("目标函数：1. 最小化总行驶距离  2. 最小化使用的车辆数")
     print("=" * 70)
 
     # 参数调优方案：根据实例规模与收敛情况选择合适的配置档位
@@ -52,7 +53,7 @@ def main():
             # 适用于快速验证、小规模实验
             # 目标：快速找到可行解，时间成本低
             'population_size': 50,
-            'max_generations': 300,
+            'max_generations': 30,
             'crossover_rate': 0.7,      # 较低交叉率以保持多样性
             'mutation_rate': 0.3,       # 较高变异率增加探索
             'local_search_freq': 1,     # 每代执行一次局部搜索（轻量化）
@@ -88,15 +89,19 @@ def main():
         'batch_size': 16,
         'train_interval': 5,
         # 行为克隆（BC）预训练选项：当为 True 且存在同名 .sol 文件时，先进行监督预训练
-        'use_behavior_cloning': True,
+        'use_behavior_cloning': False,
         'bc_epochs': 10,
         'bc_batch_size': 8,
         'min_vehicles': 5,
         'max_vehicles': 30,
         'balance_strategy': 'min_vehicles',
-        'use_nn': False,
+        'use_nn': True,
         'verbose': True,
         'print_interval': 50,  # 每50代打印一次（减少输出）
+        'use_kmeans':True,
+        'kmeans_k':10,
+        'kmeans_seed':0,
+        'debug_bc':False,
     }
     
     print(f"\n使用配置档位: {config_preset}")
@@ -151,8 +156,34 @@ def main():
                 sols = load_ground_truth(sol_path)
                 routes = sols.get(base)
                 if routes:
+                    # 数据增强：把启发式解也加入行为克隆样本以增加多样性和局部策略
+                    mixed_dataset = []
+                    # ground-truth 解（可能为单个解）
+                    mixed_dataset.append(routes)
                     try:
-                        algorithm.train_supervised(routes, epochs=config.get('bc_epochs', 10), batch_size=config.get('bc_batch_size', 8))
+                        # 最近邻启发式
+                        nn_sol = algorithm.nearest_neighbor_solution()
+                        if nn_sol:
+                            mixed_dataset.append(nn_sol)
+                    except Exception:
+                        pass
+                    try:
+                        # 节约法启发式
+                        s_sol = algorithm.savings_algorithm_solution()
+                        if s_sol:
+                            mixed_dataset.append(s_sol)
+                    except Exception:
+                        pass
+                    try:
+                        # 随机解一个作为多样性样本
+                        r_sol = algorithm.generate_random_solution()
+                        if r_sol:
+                            mixed_dataset.append(r_sol)
+                    except Exception:
+                        pass
+
+                    try:
+                        algorithm.train_supervised(mixed_dataset, epochs=config.get('bc_epochs', 10), batch_size=config.get('bc_batch_size', 8))
                     except Exception as e:
                         print(f"行为克隆训练失败: {e}")
                 else:

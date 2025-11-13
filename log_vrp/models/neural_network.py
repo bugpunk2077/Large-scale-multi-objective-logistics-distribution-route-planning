@@ -11,7 +11,7 @@ class GraphAttentionLayer(nn.Module):
         self.out_features = out_features
         self.dropout = dropout
         self.alpha = alpha
-
+        
         self.W = nn.Parameter(torch.zeros(size=(in_features, out_features)))
         self.a = nn.Parameter(torch.zeros(size=(2*out_features, 1)))
         self.leakyrelu = nn.LeakyReLU(self.alpha)

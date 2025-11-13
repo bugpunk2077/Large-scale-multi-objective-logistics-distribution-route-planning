@@ -15,6 +15,7 @@ import numpy as np
 from utils.evaluator import calculate_hypervolume
 import torch
 import torch.nn as nn
+from utils.data_loader import compute_kmeans
 from models.neural_network import NeuralVRPSolver
 
 
@@ -22,7 +23,7 @@ class Solution:
     """简单容器：routes + objectives
 
     routes: List[List[int]]，每条路径以 0（仓库）开始和结束
-    objectives: [total_distance, max_route_time, num_vehicles]
+    objectives: [total_distance, num_vehicles]（双目标：最小化距离与车辆数）
     """
 
     def __init__(self, routes, objectives=None):
@@ -31,23 +32,16 @@ class Solution:
 
     def evaluate(self, problem):
         total_distance = 0.0
-        max_time = 0.0
         for route in self.routes:
             if len(route) <= 2:
                 continue
             route_dist = 0.0
-            route_time = 0.0
             for i in range(len(route) - 1):
                 a, b = route[i], route[i + 1]
                 route_dist += problem.distance_matrix[a][b]
-                route_time += problem.distance_matrix[a][b] / getattr(problem, 'vehicle_speed', 1.0)
-                if b != 0 and hasattr(problem, 'service_times') and hasattr(problem, 'time_windows'):
-                    route_time = max(route_time, problem.time_windows[b][0])
-                    route_time += problem.service_times[b]
             total_distance += route_dist
-            max_time = max(max_time, route_time)
         num_vehicles = sum(1 for r in self.routes if len(r) > 2)
-        self.objectives = [total_distance, max_time, num_vehicles]
+        self.objectives = [total_distance, num_vehicles]
         return self.objectives
 
 
@@ -84,10 +78,19 @@ class GMOEA:
         self.nn_optimizer = None
         if self.use_nn:
             try:
-                node_dim = int(self.config.get('node_dim', 5))
+                # 基础节点特征维度（默认 x,y,demand,earliest,latest）
+                base_node_dim = int(self.config.get('node_dim', 5))
+                # 如果启用了 k-means 聚类特征，自动为每节点添加两个特征：
+                # 距离到簇中心、簇规模归一化（因此 node_dim += 2）
+                if bool(self.config.get('use_kmeans', False)):
+                    node_dim = base_node_dim + 2
+                else:
+                    node_dim = base_node_dim
+
                 hidden_dim = int(self.config.get('hidden_dim', 64))
                 n_actions = len(self.problem.coordinates)
-                self.nn_model = NeuralVRPSolver(node_dim=node_dim, hidden_dim=hidden_dim, n_actions=n_actions, n_objectives=3)
+                # 双目标 (distance, vehicles)
+                self.nn_model = NeuralVRPSolver(node_dim=node_dim, hidden_dim=hidden_dim, n_actions=n_actions, n_objectives=2)
                 self.nn_model.to(self.device)
                 lr = float(self.config.get('learning_rate', 1e-3))
                 self.nn_optimizer = torch.optim.Adam(self.nn_model.parameters(), lr=lr)
@@ -115,8 +118,19 @@ class GMOEA:
             fronts = self.fast_non_dominated_sort(population)
             pareto = fronts[0] if fronts else []
             if pareto:
-                maxd = float(np.max(self.problem.distance_matrix)) if hasattr(self.problem, 'distance_matrix') else 1.0
-                ref = [maxd * 10, maxd * 10, max(1, getattr(self.problem, 'num_vehicles', 1))]
+                # 根据当前 Pareto 动态构建参考点，确保参考点严格位于所有解之上
+                objs = np.array([s.objectives for s in pareto], dtype=float)
+                # 以 Pareto 最大值为基准，乘以一个安全裕度
+                max_vals = objs.max(axis=0)
+                # 若某一维的 max_val 非正则退回到问题的 distance_matrix 或 num_vehicles
+                try:
+                    maxd = float(np.max(self.problem.distance_matrix)) if hasattr(self.problem, 'distance_matrix') else 1.0
+                except Exception:
+                    maxd = 1.0
+                fallback = np.array([maxd * 10.0, max(1.0, float(getattr(self.problem, 'num_vehicles', 1)))])
+                # 使用 max(max_vals, fallback) 并乘以 margin
+                ref_arr = np.maximum(max_vals, fallback) * 1.1
+                ref = ref_arr.tolist()
                 hv = calculate_hypervolume(pareto, ref)
             else:
                 hv = 0.0
@@ -130,7 +144,7 @@ class GMOEA:
                     bests = pop_objs.min(axis=0)
                     avgs = pop_objs.mean(axis=0)
                     pareto_size = len(pareto)
-                    print(f"Gen {gen+1}/{self.max_generations} | Pareto {pareto_size} | HV {hv:.4g} | best(dist,time,veh) = ({bests[0]:.2f}, {bests[1]:.2f}, {int(bests[2])}) | avg = ({avgs[0]:.2f}, {avgs[1]:.2f}, {avgs[2]:.2f})")
+                    print(f"Gen {gen+1}/{self.max_generations} | Pareto {pareto_size} | HV {hv:.4g} | best(dist,veh) = ({bests[0]:.2f}, {int(bests[1])}) | avg = ({avgs[0]:.2f}, {avgs[1]:.2f})")
                 except Exception:
                     print(f"Gen {gen+1}/{self.max_generations} | Pareto {len(pareto)} | HV {hv:.4g}")
 
@@ -182,7 +196,6 @@ class GMOEA:
                 population.append(s)
         except Exception:
             pass
-
 
         # 填充：最近邻、随机与（可选）神经网络混合
         while len(population) < self.population_size:
@@ -600,6 +613,32 @@ class GMOEA:
             else:
                 earliest, latest = 0.0, 1e9
             feats[i, :] = [x, y, d, float(earliest), float(latest)]
+
+        # 可选：基于 k-means 的局部簇特征（距离到簇中心、簇规模归一化）
+        try:
+            if bool(self.config.get('use_kmeans', False)):
+                k = int(self.config.get('kmeans_k', 4))
+                labels, centers = compute_kmeans(coords, k=k, random_state=int(self.config.get('kmeans_seed', 0)))
+                labels = np.array(labels, dtype=int)
+                centers = np.array(centers, dtype=float)
+                # 计算每个点到其簇中心的距离
+                dists_to_center = np.zeros((n,), dtype=float)
+                for i in range(n):
+                    lbl = labels[i] if i < len(labels) else 0
+                    c = centers[lbl]
+                    xi, yi = coords[i]
+                    dists_to_center[i] = float(((xi - c[0]) ** 2 + (yi - c[1]) ** 2) ** 0.5)
+                # 簇规模归一化（cluster size / max_size）
+                cluster_sizes = np.array([np.sum(labels == j) for j in range(centers.shape[0])], dtype=float)
+                max_size = float(cluster_sizes.max()) if cluster_sizes.size else 1.0
+                size_norm = np.array([cluster_sizes[labels[i]] / max_size for i in range(n)], dtype=float)
+
+                # 将两列特征拼接到 feats
+                feats = np.hstack([feats, dists_to_center.reshape(-1, 1), size_norm.reshape(-1, 1)])
+        except Exception:
+            # 若 k-means 失败则忽略此特征
+            pass
+
         return feats
 
     def _solution_to_route_tensor(self, solution, max_len):
@@ -644,7 +683,8 @@ class GMOEA:
             maxd = float(np.max(self.problem.distance_matrix)) if hasattr(self.problem, 'distance_matrix') else 1.0
         except Exception:
             maxd = 1.0
-        ref = torch.tensor([maxd * 10.0, maxd * 10.0, max(1.0, float(getattr(self.problem, 'num_vehicles', 1))) * 2.0], dtype=torch.float32, device=self.device)
+        # 双目标参考点：距离和车辆数
+        ref = torch.tensor([maxd * 10.0, max(1.0, float(getattr(self.problem, 'num_vehicles', 1))) * 2.0], dtype=torch.float32, device=self.device)
 
         # 1) Value 网络预测与损失（使用规范化目标以避免数值爆炸）
         try:
@@ -770,10 +810,12 @@ class GMOEA:
 
         ce_loss_fn = nn.CrossEntropyLoss(reduction='mean')
 
+        debug_bc = bool(self.config.get('debug_bc', False))
         for ep in range(int(epochs)):
             random.shuffle(dataset)
             total_loss = 0.0
             batches = 0
+            debug_prints = 0
             for i in range(0, len(dataset), batch_size):
                 batch = dataset[i:i + batch_size]
                 self.nn_model.train()
@@ -786,8 +828,20 @@ class GMOEA:
                     for r in routes:
                         for n in r:
                             if n != 0:
-                                seq.append(int(n))
+                                try:
+                                    seq.append(int(n))
+                                except Exception:
+                                    # skip non-int entries
+                                    pass
                     if not seq:
+                        continue
+
+                    # 保护性过滤：确保所有索引在当前实例的节点范围内（0..n_nodes-1）
+                    seq = [int(n) for n in seq if 0 <= int(n) < n_nodes]
+                    if not seq:
+                        # 如果过滤后为空，跳过该解并打印调试信息（若开启）
+                        if debug_bc:
+                            print(f"[BC DEBUG] 跳过样本：所有目标索引超出范围或被过滤，原始 routes={routes}")
                         continue
                     visited = set([0])
                     for t_idx, nxt in enumerate(seq):
@@ -807,29 +861,73 @@ class GMOEA:
                                     action_logits = out[0]
                             else:
                                 action_logits = out
+
+                            # BC debug: 打印 logits/target/visited_mask 的形状和摘要（有限次数）
+                            if debug_bc and debug_prints < 5:
+                                try:
+                                    print(f"[BC DEBUG] epoch{ep+1} batch_idx {i} step {t_idx}: action_logits.shape={getattr(action_logits, 'shape', None)}, target={nxt}, visited_sum={int(visited_mask_step.sum().item())}")
+                                except Exception:
+                                    pass
+                                debug_prints += 1
+
+                            # 目标张量
                             target = torch.tensor([nxt], dtype=torch.long, device=self.device)
+                            # 如果 target 超出 logits 维度范围，打印警告（有助于定位 .sol 索引偏移问题）
+                            try:
+                                if action_logits.dim() >= 2 and (target.item() >= action_logits.size(-1)):
+                                    print(f"[BC WARN] target index {target.item()} >= action_logits.size({action_logits.size(-1)}) - 可能索引越界")
+                            except Exception:
+                                pass
+
                             loss_step = ce_loss_fn(action_logits, target)
                             batch_loss = batch_loss + loss_step
                             sample_count += 1
-                        except Exception:
+                        except Exception as ex:
+                            if debug_bc:
+                                print(f"[BC DEBUG] step exception: {ex}")
                             # 忽略单步失败
                             pass
                         visited.add(nxt)
 
                 if sample_count > 0:
+                    # 保护性处理：规范化并防止非数或异常大值
                     batch_loss = batch_loss / float(max(1, sample_count))
+                    try:
+                        loss_val = float(batch_loss.detach().cpu().item())
+                    except Exception:
+                        loss_val = float('nan')
+
+                    # 如果 loss 非有限或过大，记录并用可表示的替代值，同时打印诊断信息
+                    if not np.isfinite(loss_val) or loss_val > 1e6:
+                        print(f"[BC WARN] 非常规 batch loss 值: {loss_val} (被修正)")
+                        loss_val = 1e6
+
                     try:
                         batch_loss.backward()
                         self.nn_optimizer.step()
                     except Exception:
+                        # 若反向或优化器出错，只记录 loss，不中断训练循环
                         pass
-                    total_loss += float(batch_loss.detach().cpu().item())
+
+                    total_loss += float(loss_val)
                     batches += 1
 
-            avg_loss = total_loss / max(1, batches)
-            print(f"BC epoch {ep+1}/{int(epochs)} avg_loss={avg_loss:.6f}")
-            # 记录到训练历史以便可视化
-            self.training_history.setdefault('bc_loss', []).append(float(avg_loss))
+            # 保护性平均：如果没有有效批次则记为 NaN
+            if batches == 0:
+                avg_loss = float('nan')
+            else:
+                avg_loss = total_loss / float(batches)
+
+            # 如果 avg_loss 非有限或异常，打印诊断并替换为可序列化的大值
+            if not np.isfinite(avg_loss):
+                print(f"[BC WARN] epoch {ep+1} 计算到非有限 avg_loss={avg_loss}")
+                store_loss = 1e6
+            else:
+                store_loss = float(avg_loss)
+
+            print(f"BC epoch {ep+1}/{int(epochs)} avg_loss={store_loss:.6f}")
+            # 记录到训练历史以便可视化（保持数值可序列化）
+            self.training_history.setdefault('bc_loss', []).append(float(store_loss))
 
     def fast_non_dominated_sort(self, population):
         if not population:
